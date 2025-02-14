@@ -1,1 +1,344 @@
+<!DOCTYPE html>
+<html lang="en">
 
+<head>
+    <meta charset="UTF-8" />
+    <title>Face Recognition Attendance</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        /* Pastel gradient background */
+        body {
+            background: linear-gradient(to top right,
+                    rgba(237, 233, 254, 1),
+                    rgba(250, 245, 255, 1),
+                    rgba(244, 232, 255, 1));
+        }
+
+        /* Glass effect for cards */
+        .glass {
+            background: rgba(255, 255, 255, 0.6);
+            backdrop-filter: blur(12px);
+        }
+    </style>
+</head>
+
+<body class="min-h-screen flex flex-col items-center justify-center text-gray-800">
+    <div class="container mx-auto px-4 py-8">
+        <h1 class="text-4xl font-bold text-center mb-8">Face Recognition Attendance</h1>
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-8">
+            <!-- Video & Detection Card -->
+            <div class="glass rounded-2xl shadow-lg p-6 flex flex-col">
+                <div class="relative mb-4">
+                    <video id="video" autoplay muted class="w-full h-auto rounded-lg"></video>
+                    <!-- Overlay canvas for drawing bounding boxes and labels -->
+                    <canvas id="overlay" class="absolute top-0 left-0 w-full h-full rounded-lg"></canvas>
+                </div>
+                <div class="flex justify-between gap-4">
+                    <button onclick="testFaceDetection()"
+                        class="flex-1 bg-indigo-600 text-white px-4 py-2 rounded-md hover:bg-indigo-700 transition">
+                        Test Detection
+                    </button>
+                    <button onclick="markAttendance()"
+                        class="flex-1 bg-indigo-600 text-white px-4 py-2 rounded-md hover:bg-indigo-700 transition">
+                        Mark Attendance
+                    </button>
+                </div>
+            </div>
+            <!-- Registration & Attendance Card -->
+            <div class="glass rounded-2xl shadow-lg p-6 flex flex-col">
+                <h2 class="text-2xl font-semibold mb-4">Register User</h2>
+                <form id="registrationForm" class="space-y-4 mb-8">
+                    <input type="text" id="userName" placeholder="Enter name" required
+                        class="w-full p-3 rounded-md border border-slate-300 focus:outline-none focus:ring-2 focus:ring-indigo-600" />
+                    <button type="submit"
+                        class="w-full bg-indigo-600 text-white px-4 py-2 rounded-md hover:bg-indigo-700 transition">
+                        Register Face
+                    </button>
+                </form>
+                <h2 class="text-2xl font-semibold mb-4">Attendance Records</h2>
+                <div class="overflow-x-auto">
+                    <table class="min-w-full text-left">
+                        <thead>
+                            <tr class="border-b border-slate-300">
+                                <th class="py-2 px-3 font-medium">Name</th>
+                                <th class="py-2 px-3 font-medium">Time</th>
+                            </tr>
+                        </thead>
+                        <tbody id="attendanceBody" class="divide-y divide-slate-200">
+                            <!-- Attendance records will appear here -->
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Firebase (CDN) -->
+    <script src="https://www.gstatic.com/firebasejs/8.10.0/firebase-app.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/8.10.0/firebase-firestore.js"></script>
+
+    <!-- TensorFlow.js, BlazeFace, and MobileNet (CDNs) -->
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@latest"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/blazeface"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/mobilenet"></script>
+
+    <script>
+    
+        const firebaseConfig = {
+            apiKey: "AIzaSyAjZlAWvvFxhJuvWm4sLq92uACjWbTyOyM",
+            authDomain: "hackathon-proj-74393.firebaseapp.com",
+            databaseURL: "https://hackathon-proj-74393-default-rtdb.firebaseio.com",
+            projectId: "hackathon-proj-74393",
+            storageBucket: "hackathon-proj-74393.firebasestorage.app",
+            messagingSenderId: "1080326968785",
+            appId: "1:1080326968785:web:7c028f843e0ee929debcf0",
+            measurementId: "G-4EB8E5F13R"
+        };
+        firebase.initializeApp(firebaseConfig);
+        const db = firebase.firestore();
+
+        const video = document.getElementById('video');
+        const overlay = document.getElementById('overlay');
+        const ctx = overlay.getContext('2d');
+        const userNameInput = document.getElementById('userName');
+
+        let blazeFaceModel = null;
+        let mobileNetModel = null;
+        let registeredUsers = []; // Array of { name, embedding } loaded from Firestore
+        let currentBestMatch = null; // Recognized user name from real-time detection
+        let lastEmbeddingTime = 0;
+        const EMBEDDING_INTERVAL = 1000; // compute embedding at most once per 1000ms
+        const MATCH_THRESHOLD = 0.7; // Adjust threshold as needed
+
+        
+        function euclideanDistance(a, b) {
+            let sum = 0;
+            for (let i = 0; i < a.length; i++) {
+                const diff = a[i] - b[i];
+                sum += diff * diff;
+            }
+            return Math.sqrt(sum);
+        }
+
+        
+        async function computeEmbedding(bbox) {
+            const [x1, y1] = bbox.topLeft;
+            const [x2, y2] = bbox.bottomRight;
+            const width = x2 - x1;
+            const height = y2 - y1;
+            if (width <= 0 || height <= 0) return null;
+
+            // Create an offscreen canvas to crop the face
+            const faceCanvas = document.createElement('canvas');
+            faceCanvas.width = width;
+            faceCanvas.height = height;
+            const faceCtx = faceCanvas.getContext('2d');
+            faceCtx.drawImage(video, x1, y1, width, height, 0, 0, width, height);
+
+            // Convert to tensor and resize to MobileNet's input size (224x224)
+            let faceTensor = tf.browser.fromPixels(faceCanvas);
+            faceTensor = tf.image.resizeBilinear(faceTensor, [224, 224]);
+            // Normalize pixel values to [0, 1]
+            faceTensor = faceTensor.expandDims(0).toFloat().div(tf.scalar(255));
+
+            // Get embedding (use infer with 'conv_preds' or simply true for embedding if supported)
+            const embeddingTensor = mobileNetModel.infer(faceTensor, true);
+            const embeddingArray = Array.from(embeddingTensor.dataSync());
+            faceTensor.dispose();
+            embeddingTensor.dispose();
+            return embeddingArray;
+        }
+
+        /********************************************
+         * Load Registered Users from Firestore     *
+         ********************************************/
+        async function loadRegisteredUsers() {
+            const snapshot = await db.collection('users').get();
+            registeredUsers = [];
+            snapshot.forEach(doc => {
+                const data = doc.data();
+                if (data.name && data.embedding) {
+                    registeredUsers.push({ name: data.name, embedding: data.embedding });
+                }
+            });
+            console.log("Registered users loaded:", registeredUsers);
+        }
+
+        /********************************************
+         * Initialize Models & Video                *
+         ********************************************/
+        async function loadModels() {
+            // Load BlazeFace model
+            blazeFaceModel = await blazeface.load();
+            console.log("BlazeFace model loaded.");
+            // Load MobileNet model (for embeddings)
+            mobileNetModel = await mobilenet.load();
+            console.log("MobileNet model loaded.");
+        }
+
+        async function startVideo() {
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({ video: {} });
+                video.srcObject = stream;
+                video.onloadedmetadata = () => {
+                    overlay.width = video.videoWidth;
+                    overlay.height = video.videoHeight;
+                    console.log(`Video dimensions: ${video.videoWidth} x ${video.videoHeight}`);
+                };
+            } catch (err) {
+                console.error("Error accessing camera:", err);
+            }
+        }
+
+        
+        async function detectionLoop() {
+            ctx.clearRect(0, 0, overlay.width, overlay.height);
+            overlay.width = video.videoWidth;
+            overlay.height = video.videoHeight;
+
+            if (video.readyState === 4) {
+                // Detect face using BlazeFace
+                const detection = await blazeFaceModel.estimateFaces(video, false);
+                if (detection.length > 0) {
+                    // Use first detected face
+                    const face = detection[0];
+                    // Draw bounding box
+                    const [x1, y1] = face.topLeft;
+                    const [x2, y2] = face.bottomRight;
+                    ctx.strokeStyle = "rgb(99,102,241)"; // Indigo
+                    ctx.lineWidth = 3;
+                    ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
+
+                    // Every EMBEDDING_INTERVAL ms, compute embedding for recognition
+                    if (performance.now() - lastEmbeddingTime > EMBEDDING_INTERVAL && registeredUsers.length > 0) {
+                        lastEmbeddingTime = performance.now();
+                        const embedding = await computeEmbedding(face);
+                        if (embedding) {
+                            // Compare with each registered user
+                            let bestMatch = { name: null, distance: Infinity };
+                            registeredUsers.forEach(user => {
+                                const dist = euclideanDistance(embedding, user.embedding);
+                                if (dist < bestMatch.distance) {
+                                    bestMatch = { name: user.name, distance: dist };
+                                }
+                            });
+                            // If best match is within threshold, set currentBestMatch
+                            currentBestMatch = bestMatch.distance < MATCH_THRESHOLD ? bestMatch.name : null;
+                        }
+                    }
+
+                    // If recognized, draw label below bounding box
+                    if (currentBestMatch) {
+                        ctx.fillStyle = "rgba(99,102,241,0.9)";
+                        ctx.font = "20px Arial";
+                        ctx.fillText(currentBestMatch, x1, y1 - 10);
+                    }
+                } else {
+                    currentBestMatch = null;
+                }
+            }
+            requestAnimationFrame(detectionLoop);
+        }
+
+        /********************************************
+         * Registration: Save Face Embedding        *
+         ********************************************/
+        document.getElementById('registrationForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const name = userNameInput.value.trim();
+            if (!name) {
+                alert("Please enter a name!");
+                return;
+            }
+            // Detect face once
+            const detection = await blazeFaceModel.estimateFaces(video, false);
+            if (detection.length === 0) {
+                alert("No face detected during registration. Try again.");
+                return;
+            }
+            const face = detection[0];
+            const embedding = await computeEmbedding(face);
+            if (!embedding) {
+                alert("Failed to compute face embedding. Try again.");
+                return;
+            }
+            // Save to Firestore
+            await db.collection('users').add({
+                name,
+                embedding,
+                createdAt: firebase.firestore.FieldValue.serverTimestamp()
+            });
+            alert(`User "${name}" registered successfully!`);
+            userNameInput.value = "";
+            // Reload registered users
+            await loadRegisteredUsers();
+        });
+
+        /********************************************
+         * Test Detection Button                    *
+         ********************************************/
+        function testFaceDetection() {
+            if (currentBestMatch) {
+                alert(`Face recognized as: ${currentBestMatch}`);
+            } else {
+                alert("No recognized face at the moment.");
+            }
+        }
+
+        /********************************************
+         * Mark Attendance                          *
+         ********************************************/
+        async function markAttendance() {
+            if (!currentBestMatch) {
+                alert("No recognized face to mark attendance for!");
+                return;
+            }
+            await db.collection('attendance').add({
+                name: currentBestMatch,
+                timestamp: firebase.firestore.FieldValue.serverTimestamp()
+            });
+            alert(`Attendance marked for: ${currentBestMatch}`);
+        }
+
+        /********************************************
+         * Update Attendance Table (every 5 sec)    *
+         ********************************************/
+        async function updateAttendanceTable() {
+            const snapshot = await db.collection('attendance')
+                .orderBy('timestamp', 'desc')
+                .limit(10)
+                .get();
+            const tbody = document.getElementById('attendanceBody');
+            tbody.innerHTML = "";
+            snapshot.forEach(doc => {
+                const data = doc.data();
+                const timeStr = data.timestamp ? new Date(data.timestamp.toDate()).toLocaleString() : "N/A";
+                const row = document.createElement("tr");
+                row.innerHTML = `
+                  <td class="py-2 px-3">${data.name}</td>
+                  <td class="py-2 px-3">${timeStr}</td>
+                `;
+                tbody.appendChild(row);
+            });
+        }
+        setInterval(updateAttendanceTable, 5000);
+
+        /********************************************
+         * Initialize Everything                    *
+         ********************************************/
+        async function init() {
+            await loadModels();
+            await startVideo();
+            // When video is ready, set overlay dimensions
+            video.addEventListener("loadeddata", () => {
+                overlay.width = video.videoWidth;
+                overlay.height = video.videoHeight;
+            });
+            await loadRegisteredUsers();
+            detectionLoop();
+        }
+        init();
+    </script>
+</body>
+
+</html>
