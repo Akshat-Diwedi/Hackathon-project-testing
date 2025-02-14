@@ -205,7 +205,7 @@
                     // Draw bounding box
                     const [x1, y1] = face.topLeft;
                     const [x2, y2] = face.bottomRight;
-                    ctx.strokeStyle = "rgb(99,102,241)"; // Indigo
+                    ctx.strokeStyle = "rgba(248, 0, 0, 0.9)"; // red
                     ctx.lineWidth = 3;
                     ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
 
@@ -243,6 +243,7 @@
         /********************************************
          * Registration: Save Face Embedding        *
          ********************************************/
+        
         document.getElementById('registrationForm').addEventListener('submit', async (e) => {
             e.preventDefault();
             const name = userNameInput.value.trim();
@@ -321,7 +322,7 @@
                 tbody.appendChild(row);
             });
         }
-        setInterval(updateAttendanceTable, 5000);
+        setInterval(updateAttendanceTable, 10000);
 
         /********************************************
          * Initialize Everything                    *
